@@ -1,0 +1,10 @@
+name: Daily NXP post
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS -X POST "https://nxp-wireless-daily-beacon.lovable.app/api/public/daily-post"
