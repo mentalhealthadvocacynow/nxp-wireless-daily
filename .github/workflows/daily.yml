@@ -19,7 +19,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          DATE=$(date -u +%F)
           YEAR=$(date -u +%Y)
           MONTH=$(date -u +%m)
           DAY=$(date -u +%d)
@@ -40,12 +39,12 @@ jobs:
             "generationConfig": {
               "temperature": 0.7,
               "topP": 0.9,
-              "maxOutputTokens": 3000
+              "maxOutputTokens": 8192
             }
           }
           JSON
 
-          curl -fsSL "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}" \
+          curl -fsSL "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}" \
             -H "Content-Type: application/json" \
             -X POST \
             --data @/tmp/gemini-request.json > /tmp/gemini-response.json
@@ -59,7 +58,19 @@ jobs:
           with open('/tmp/gemini-response.json', 'r', encoding='utf-8') as fh:
               data = json.load(fh)
 
-          text = data['candidates'][0]['content']['parts'][0]['text']
+          candidates = data.get('candidates')
+          if not candidates:
+              sys.exit('Gemini returned no candidates: ' + json.dumps(data)[:500])
+
+          candidate = candidates[0]
+          if candidate.get('finishReason') not in (None, 'STOP'):
+              print('Warning: finishReason =', candidate.get('finishReason'), file=sys.stderr)
+
+          try:
+              text = candidate['content']['parts'][0]['text']
+          except (KeyError, IndexError):
+              sys.exit('Unexpected response shape: ' + json.dumps(candidate)[:500])
+
           output_path.write_text(text.strip() + '\n', encoding='utf-8')
           PY
 
@@ -73,9 +84,15 @@ jobs:
 
           text = archive.read_text(encoding='utf-8')
           if link not in text:
-              insert_at = text.find('## Archive') + len('## Archive\n\n')
-              updated = text[:insert_at] + link + '\n' + text[insert_at:]
-              archive.write_text(updated, encoding='utf-8')
+              marker = '## Archive'
+              idx = text.find(marker)
+              if idx == -1:
+                  text = text.rstrip() + '\n\n' + marker + '\n\n' + link + '\n'
+              else:
+                  insert_at = idx + len(marker)
+                  updated = text[:insert_at] + '\n\n' + link + '\n' + text[insert_at:].lstrip('\n')
+                  text = updated
+              archive.write_text(text, encoding='utf-8')
           PY
 
       - name: Commit generated post
