@@ -3,8 +3,89 @@ on:
   schedule:
     - cron: "0 13 * * *"
   workflow_dispatch:
+
 jobs:
   trigger:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - run: curl -fsS -X POST "https://nxp-wireless-daily-beacon.lovable.app/api/public/daily-post"
+      - uses: actions/checkout@v4
+
+      - name: Generate today's NXP post with Gemini Flash Lite
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          DATE=$(date -u +%F)
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%m)
+          DAY=$(date -u +%d)
+          FILE="posts/${YEAR}/${MONTH}/${DAY}.md"
+          mkdir -p "$(dirname "$FILE")"
+
+          cat > /tmp/gemini-request.json <<'JSON'
+          {
+            "contents": [
+              {
+                "parts": [
+                  {
+                    "text": "Write a detailed technical deep-dive article for a Jekyll blog called 'NXP Wireless Daily'. Focus on an NXP wireless topic relevant to Wi-Fi, Bluetooth, Thread, Zigbee, Matter, UWB, NFC, or automotive wireless connectivity. Include clear sections: title, overview, key features, under the hood, where it shines (use cases), getting started, and takeaway. Keep it accurate, practical, and written for engineers. Use Markdown formatting only. Do not include code fences or YAML front matter. Keep it around 1200-1800 words."
+                  }
+                ]
+              }
+            ],
+            "generationConfig": {
+              "temperature": 0.7,
+              "topP": 0.9,
+              "maxOutputTokens": 3000
+            }
+          }
+          JSON
+
+          curl -fsSL "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data @/tmp/gemini-request.json > /tmp/gemini-response.json
+
+          python3 - "$FILE" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          output_path = pathlib.Path(sys.argv[1])
+          with open('/tmp/gemini-response.json', 'r', encoding='utf-8') as fh:
+              data = json.load(fh)
+
+          text = data['candidates'][0]['content']['parts'][0]['text']
+          output_path.write_text(text.strip() + '\n', encoding='utf-8')
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import datetime
+
+          archive = Path('index.md')
+          date = datetime.date.today().strftime('%Y-%m-%d')
+          link = f"- [{date}](posts/{date[:4]}/{date[5:7]}/{date[8:10]}.md)"
+
+          text = archive.read_text(encoding='utf-8')
+          if link not in text:
+              insert_at = text.find('## Archive') + len('## Archive\n\n')
+              updated = text[:insert_at] + link + '\n' + text[insert_at:]
+              archive.write_text(updated, encoding='utf-8')
+          PY
+
+      - name: Commit generated post
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add posts index.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Daily NXP post"
+          git push
