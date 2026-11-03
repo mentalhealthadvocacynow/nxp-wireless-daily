@@ -9,13 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      models: read
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate today's NXP post with Gemini Flash Lite
+      - name: Generate today's NXP post with GitHub Models
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -25,29 +26,28 @@ jobs:
           FILE="posts/${YEAR}/${MONTH}/${DAY}.md"
           mkdir -p "$(dirname "$FILE")"
 
-          cat > /tmp/gemini-request.json <<'JSON'
+          MODEL="openai/gpt-4.1-mini"
+
+          cat > /tmp/llm-request.json <<JSON
           {
-            "contents": [
+            "model": "${MODEL}",
+            "messages": [
               {
-                "parts": [
-                  {
-                    "text": "Write a detailed technical deep-dive article for a Jekyll blog called 'NXP Wireless Daily'. Focus on an NXP wireless topic relevant to Wi-Fi, Bluetooth, Thread, Zigbee, Matter, UWB, NFC, or automotive wireless connectivity. Include clear sections: title, overview, key features, under the hood, where it shines (use cases), getting started, and takeaway. Keep it accurate, practical, and written for engineers. Use Markdown formatting only. Do not include code fences or YAML front matter. Keep it around 1200-1800 words."
-                  }
-                ]
+                "role": "user",
+                "content": "Write a detailed technical deep-dive article for a Jekyll blog called 'NXP Wireless Daily'. Focus on an NXP wireless topic relevant to Wi-Fi, Bluetooth, Thread, Zigbee, Matter, UWB, NFC, or automotive wireless connectivity. Include clear sections: title, overview, key features, under the hood, where it shines (use cases), getting started, and takeaway. Keep it accurate, practical, and written for engineers. Use Markdown formatting only. Do not include code fences or YAML front matter. Keep it around 1200-1800 words."
               }
             ],
-            "generationConfig": {
-              "temperature": 0.7,
-              "topP": 0.9,
-              "maxOutputTokens": 8192
-            }
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 4000
           }
           JSON
 
-          curl -fsSL "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}" \
+          curl -fsSL "https://models.github.ai/inference/chat/completions" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
             -X POST \
-            --data @/tmp/gemini-request.json > /tmp/gemini-response.json
+            --data @/tmp/llm-request.json > /tmp/llm-response.json
 
           python3 - "$FILE" <<'PY'
           import json
@@ -55,22 +55,14 @@ jobs:
           import sys
 
           output_path = pathlib.Path(sys.argv[1])
-          with open('/tmp/gemini-response.json', 'r', encoding='utf-8') as fh:
+          with open('/tmp/llm-response.json', 'r', encoding='utf-8') as fh:
               data = json.load(fh)
 
-          candidates = data.get('candidates')
-          if not candidates:
-              sys.exit('Gemini returned no candidates: ' + json.dumps(data)[:500])
+          choices = data.get('choices')
+          if not choices:
+              sys.exit('Model returned no choices: ' + json.dumps(data)[:500])
 
-          candidate = candidates[0]
-          if candidate.get('finishReason') not in (None, 'STOP'):
-              print('Warning: finishReason =', candidate.get('finishReason'), file=sys.stderr)
-
-          try:
-              text = candidate['content']['parts'][0]['text']
-          except (KeyError, IndexError):
-              sys.exit('Unexpected response shape: ' + json.dumps(candidate)[:500])
-
+          text = choices[0]['message']['content']
           output_path.write_text(text.strip() + '\n', encoding='utf-8')
           PY
 
@@ -90,8 +82,7 @@ jobs:
                   text = text.rstrip() + '\n\n' + marker + '\n\n' + link + '\n'
               else:
                   insert_at = idx + len(marker)
-                  updated = text[:insert_at] + '\n\n' + link + '\n' + text[insert_at:].lstrip('\n')
-                  text = updated
+                  text = text[:insert_at] + '\n\n' + link + '\n' + text[insert_at:].lstrip('\n')
               archive.write_text(text, encoding='utf-8')
           PY
 
