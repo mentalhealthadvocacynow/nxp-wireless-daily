@@ -19,8 +19,8 @@ jobs:
     timeout-minutes: 15
 
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_MODEL: gpt-4.1-mini
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: llama-3.3-70b-versatile
 
     steps:
       - name: Check out repository
@@ -28,13 +28,14 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Generate today's NXP post
+      - name: Generate today's NXP post with Groq
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-            echo "::error::Missing OPENAI_API_KEY repository secret."
+          if [[ -z "${GROQ_API_KEY:-}" ]]; then
+            echo "::error::Missing GROQ_API_KEY repository secret."
+            echo "Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
 
@@ -53,9 +54,11 @@ jobs:
           ).date()
 
           date_string = today.isoformat()
+
           post_path = pathlib.Path(
               f"posts/{today:%Y}/{today:%m}/{today:%d}.md"
           )
+
           archive_path = pathlib.Path("index.md")
 
           def update_archive():
@@ -95,7 +98,7 @@ jobs:
               archive_path.write_text(text, encoding="utf-8")
               print("Updated archive.")
 
-          # Avoid paying for another generation when rerunning today.
+          # Do not regenerate an existing, nonempty daily post.
           if post_path.exists() and post_path.stat().st_size > 0:
               print(f"Today's post already exists: {post_path}")
               update_archive()
@@ -137,156 +140,4 @@ jobs:
           - Write for engineers: accurate, practical, and specific.
           - Clearly distinguish wireless-standard capabilities from
             capabilities of a particular NXP device or software stack.
-          - Do not invent part numbers, specifications, SDK APIs,
-            benchmark figures, certifications, URLs, or release dates.
-          - Do not imply that you checked live documentation.
-          - If a product detail is uncertain, omit it or explicitly
-            tell readers to verify it in the current NXP documentation.
-          - Avoid unsupported claims about the latest announcements.
-          - Include practical integration constraints and tradeoffs.
-          - In Getting started, describe the documentation and hardware
-            checks an engineer should perform before implementation.
-          """
-
-          payload = {
-              "model": os.environ["OPENAI_MODEL"],
-              "messages": [
-                  {
-                      "role": "system",
-                      "content": (
-                          "You are a careful embedded wireless technical "
-                          "writer. Prioritize accuracy over specificity. "
-                          "You have no live browsing in this request."
-                      ),
-                  },
-                  {
-                      "role": "user",
-                      "content": prompt.strip(),
-                  },
-              ],
-              "temperature": 0.7,
-              "max_completion_tokens": 5000,
-          }
-
-          request = urllib.request.Request(
-              "https://api.openai.com/v1/chat/completions",
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Authorization": (
-                      f"Bearer {os.environ['OPENAI_API_KEY']}"
-                  ),
-                  "Content-Type": "application/json",
-              },
-              method="POST",
-          )
-
-          retryable_statuses = {429, 500, 502, 503, 504}
-          max_attempts = 4
-
-          for attempt in range(1, max_attempts + 1):
-              try:
-                  with urllib.request.urlopen(
-                      request, timeout=180
-                  ) as response:
-                      data = json.load(response)
-                  break
-
-              except urllib.error.HTTPError as exc:
-                  error_body = exc.read().decode(
-                      "utf-8", errors="replace"
-                  )
-
-                  print(
-                      f"Model API returned HTTP {exc.code} "
-                      f"(attempt {attempt}/{max_attempts})."
-                  )
-
-                  if (
-                      exc.code not in retryable_statuses
-                      or attempt == max_attempts
-                  ):
-                      print(error_body[:8000])
-                      raise SystemExit(1)
-
-                  retry_after = exc.headers.get("Retry-After")
-                  try:
-                      delay = min(float(retry_after), 120)
-                  except (TypeError, ValueError):
-                      delay = min(
-                          10 * (2 ** (attempt - 1))
-                          + random.uniform(0, 3),
-                          120,
-                      )
-
-                  print(f"Retrying in {delay:.1f} seconds.")
-                  time.sleep(delay)
-
-              except (urllib.error.URLError, TimeoutError) as exc:
-                  print(
-                      f"Network error "
-                      f"(attempt {attempt}/{max_attempts}): {exc}"
-                  )
-
-                  if attempt == max_attempts:
-                      raise SystemExit(1)
-
-                  time.sleep(10 * (2 ** (attempt - 1)))
-
-          choices = data.get("choices")
-          if not choices:
-              print("::error::Model returned no choices.")
-              print(json.dumps(data)[:8000])
-              raise SystemExit(1)
-
-          choice = choices[0]
-          finish_reason = choice.get("finish_reason")
-
-          if finish_reason != "stop":
-              print(
-                  "::error::Model did not finish normally: "
-                  f"{finish_reason}. No post was written."
-              )
-              raise SystemExit(1)
-
-          text = choice.get("message", {}).get("content")
-
-          if not isinstance(text, str) or not text.strip():
-              print("::error::Model returned empty article content.")
-              raise SystemExit(1)
-
-          text = text.strip()
-
-          if text.startswith("---") or "```" in text:
-              print(
-                  "::error::Article contains YAML front matter "
-                  "or code fences, contrary to the prompt."
-              )
-              raise SystemExit(1)
-
-          post_path.parent.mkdir(parents=True, exist_ok=True)
-          post_path.write_text(text + "\n", encoding="utf-8")
-
-          print(f"Wrote {post_path}")
-          print(f"Approximate word count: {len(text.split())}")
-
-          update_archive()
-          PY
-
-      - name: Commit generated post
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -- posts index.md
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Daily NXP post $(date -u +%F)"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          - Do
