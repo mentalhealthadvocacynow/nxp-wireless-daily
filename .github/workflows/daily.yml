@@ -55,41 +55,84 @@ jobs:
           archive_path = pathlib.Path("index.md")
 
           def update_archive():
-              link = f"- [{date_string}]({post_path.as_posix()})"
+              import calendar
+              import re
 
               if archive_path.exists():
-                  text = archive_path.read_text(encoding="utf-8")
+                  existing = archive_path.read_text(encoding="utf-8")
               else:
-                  text = "# NXP Wireless Daily\n\n## Archive\n"
-
-              if link in text:
-                  print("Archive already contains today's link.")
-                  return
-
-              marker = "## Archive"
-              before, found, after = text.partition(marker)
-
-              if found:
-                  text = (
-                      before
-                      + marker
-                      + "\n\n"
-                      + link
-                      + "\n"
-                      + after.lstrip("\n")
-                  )
-              else:
-                  text = (
-                      text.rstrip()
-                      + "\n\n"
-                      + marker
-                      + "\n\n"
-                      + link
-                      + "\n"
+                  existing = (
+                      "# NXP Wireless Daily\n\n"
+                      "A new deep-dive into NXP wireless chips every day "
+                      "— Wi-Fi/Bluetooth, Thread/Zigbee/Matter, UWB and NFC.\n"
                   )
 
-              archive_path.write_text(text, encoding="utf-8")
-              print("Updated archive.")
+              # Preserve everything before the Archive heading.
+              archive_heading = re.search(
+                  r"^##[ \t]+Archive[ \t]*\r?$",
+                  existing,
+                  flags=re.MULTILINE,
+              )
+
+              if archive_heading:
+                  introduction = existing[:archive_heading.start()].rstrip()
+              else:
+                  introduction = existing.rstrip()
+
+              posts = []
+
+              for path in pathlib.Path("posts").glob("*/*/*.md"):
+                  try:
+                      year = int(path.parent.parent.name)
+                      month = int(path.parent.name)
+                      day = int(path.stem)
+                      post_date = datetime.date(year, month, day)
+                  except ValueError:
+                      continue
+
+                  posts.append((post_date, path))
+
+              posts.sort(key=lambda item: item[0], reverse=True)
+
+              lines = [
+                  introduction,
+                  "",
+                  "## Archive",
+              ]
+
+              current_year = None
+              current_month = None
+
+              for post_date, path in posts:
+                  if post_date.year != current_year:
+                      current_year = post_date.year
+                      current_month = None
+                      lines.extend([
+                          "",
+                          f"### {current_year}",
+                      ])
+
+                  if post_date.month != current_month:
+                      current_month = post_date.month
+                      lines.extend([
+                          "",
+                          f"#### {calendar.month_name[current_month]}",
+                          "",
+                      ])
+
+                  # Keep URLs relative to the site's index page.
+                  url = path.with_suffix(".html").as_posix()
+                  lines.append(
+                      f"- [{post_date.isoformat()}]({url})"
+                  )
+
+              updated = "\n".join(lines).rstrip() + "\n"
+
+              if updated != existing:
+                  archive_path.write_text(updated, encoding="utf-8")
+                  print(f"Rebuilt archive with {len(posts)} posts.")
+              else:
+                  print("Archive is already up to date.")
 
           if post_path.exists() and post_path.stat().st_size > 0:
               print(f"Today's post already exists: {post_path}")
