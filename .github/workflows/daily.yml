@@ -25,21 +25,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Generate today's NXP post with Groq
-        shell: bash
+        shell: python
         run: |
-          set -euo pipefail
-
-          if [[ -z "${GROQ_API_KEY:-}" ]]; then
-            echo "::error::Missing GROQ_API_KEY repository secret."
-            echo "Add it under Settings > Secrets and variables > Actions."
-            exit 1
-          fi
-
-          python3 - <<'PY'
           import datetime
           import json
           import os
@@ -49,16 +38,20 @@ jobs:
           import urllib.error
           import urllib.request
 
+          api_key = os.environ.get("GROQ_API_KEY", "").strip()
+
+          if not api_key:
+              print("::error::Missing GROQ_API_KEY repository secret.")
+              raise SystemExit(1)
+
           today = datetime.datetime.now(
               datetime.timezone.utc
           ).date()
 
           date_string = today.isoformat()
-
           post_path = pathlib.Path(
               f"posts/{today:%Y}/{today:%m}/{today:%d}.md"
           )
-
           archive_path = pathlib.Path("index.md")
 
           def update_archive():
@@ -98,7 +91,6 @@ jobs:
               archive_path.write_text(text, encoding="utf-8")
               print("Updated archive.")
 
-          # Do not regenerate an existing, nonempty daily post.
           if post_path.exists() and post_path.stat().st_size > 0:
               print(f"Today's post already exists: {post_path}")
               update_archive()
@@ -117,27 +109,176 @@ jobs:
 
           topic = topics[today.toordinal() % len(topics)]
 
-          prompt = f"""
-          Write a detailed technical deep-dive article for a Jekyll
-          blog called "NXP Wireless Daily".
+          prompt = "\n".join([
+              'Write a technical article for "NXP Wireless Daily".',
+              f"Editorial date: {date_string}.",
+              f"Today's focus: {topic}.",
+              "Focus on NXP wireless products and engineering workflows.",
+              "Write approximately 1200-1800 words.",
+              "Begin with one descriptive H1 title.",
+              "Include these H2 sections:",
+              "Overview",
+              "Key features",
+              "Under the hood",
+              "Where it shines (use cases)",
+              "Getting started",
+              "Takeaway",
+              "Use Markdown only.",
+              "Do not include code fences or YAML front matter.",
+              "Write accurately and practically for engineers.",
+              "Distinguish standard capabilities from device capabilities.",
+              "Do not invent part numbers, specifications, or SDK APIs.",
+              "Do not invent benchmarks, certifications, URLs, or dates.",
+              "Do not claim you checked live documentation.",
+              "Omit uncertain product details or flag them for verification.",
+              "Avoid unsupported claims about recent announcements.",
+              "Include integration constraints and engineering tradeoffs.",
+              "Explain the hardware and documentation checks needed to start.",
+          ])
 
-          Editorial date: {date_string}.
-          Today's focus: {topic}, specifically in the context of
-          NXP wireless products and engineering workflows.
+          payload = {
+              "model": os.environ["GROQ_MODEL"],
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a careful embedded wireless writer. "
+                          "Prioritize accuracy over specificity. "
+                          "You have no live browsing in this request."
+                      ),
+                  },
+                  {
+                      "role": "user",
+                      "content": prompt,
+                  },
+              ],
+              "temperature": 0.7,
+              "max_completion_tokens": 5000,
+          }
 
-          Requirements:
-          - Write approximately 1200-1800 words.
-          - Begin with one descriptive H1 article title.
-          - Include these H2 sections:
-            Overview
-            Key features
-            Under the hood
-            Where it shines (use cases)
-            Getting started
-            Takeaway
-          - Use Markdown only.
-          - Do not include code fences or YAML front matter.
-          - Write for engineers: accurate, practical, and specific.
-          - Clearly distinguish wireless-standard capabilities from
-            capabilities of a particular NXP device or software stack.
-          - Do
+          request = urllib.request.Request(
+              "https://api.groq.com/openai/v1/chat/completions",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          data = None
+          max_attempts = 4
+          retryable_statuses = {429, 500, 502, 503, 504}
+
+          for attempt in range(1, max_attempts + 1):
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=180
+                  ) as response:
+                      data = json.load(response)
+                  break
+
+              except urllib.error.HTTPError as exc:
+                  error_body = exc.read().decode(
+                      "utf-8", errors="replace"
+                  )
+
+                  print(
+                      f"Groq HTTP {exc.code}; "
+                      f"attempt {attempt}/{max_attempts}."
+                  )
+
+                  if (
+                      exc.code not in retryable_statuses
+                      or attempt == max_attempts
+                  ):
+                      print(error_body[:8000])
+                      raise SystemExit(1)
+
+                  retry_after = exc.headers.get("Retry-After")
+
+                  try:
+                      delay = max(0, float(retry_after))
+                  except (TypeError, ValueErr):
+                      delay = (
+                          10 * (2 ** (attempt - 1))
+                          + random.uniform(0, 3)
+                      )
+
+                  if delay > 120:
+                      print(error_body[:8000])
+                      print(
+                          "::error::Rate-limit wait exceeds 120 seconds. "
+                          "Run the workflow again later."
+                      )
+                      raise SystemExit(1)
+
+                  print(f"Retrying in {delay:.1f} seconds.")
+                  time.sleep(delay)
+                  except (urllib.error.URLError, TimeoutError) as exc:
+                  print(f"Network error: {exc}")
+
+                  if attempt == max_attempts:
+                      raise SystemExit(1)
+
+                  time.sleep(10 * (2 ** (attempt - 1)))
+
+          if not isinstance(data, dict):
+              print("::error::Invalid API response.")
+              raise SystemExit(1)
+
+          choices = data.get("choices")
+          if not choices:
+              print("::error::API returned no choices.")
+              print(json.dumps(data)[:8000])
+              raise SystemExit(1)
+
+          choice = choices[0]
+
+          if choice.get("finish_reason") != "stop":
+              print(
+                  "::error::Generation did not finish normally: "
+                  + str(choice.get("finish_reason"))
+              )
+              raise SystemExit(1)
+
+          text = choice.get("message", {}).get("content")
+
+          if not isinstance(text, str) or not text.strip():
+              print("::error::Model returned empty content.")
+              raise SystemExit(1)
+              text = text.strip()
+
+          if text.startswith("---") or "```" in text:
+              print(
+                  "::error::Article contains unexpected front matter "
+                  "or code fences. No post was written."
+              )
+              raise SystemExit(1)
+
+          post_path.parent.mkdir(parents=True, exist_ok=True)
+          post_path.write_text(text + "\n", encoding="utf-8")
+
+          print(f"Wrote {post_path}")
+          print(f"Approximate word count: {len(text.split())}")
+
+          update_archive()
+
+       - name: Commit generated post
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- posts index.md
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Daily NXP post $(date -u +%F)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
