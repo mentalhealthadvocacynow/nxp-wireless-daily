@@ -1,99 +1,292 @@
 name: Daily NXP post
+
 on:
   schedule:
-    - cron: "0 13 * * *"
+    # Daily at 13:17 UTC.
+    - cron: "17 13 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-nxp-post-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  trigger:
+  generate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      models: read
+    timeout-minutes: 15
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-4.1-mini
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Generate today's NXP post with GitHub Models
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Generate today's NXP post
+        shell: bash
         run: |
           set -euo pipefail
 
-          YEAR=$(date -u +%Y)
-          MONTH=$(date -u +%m)
-          DAY=$(date -u +%d)
-          FILE="posts/${YEAR}/${MONTH}/${DAY}.md"
-          mkdir -p "$(dirname "$FILE")"
-
-          MODEL="openai/gpt-4.1-mini"
-
-          cat > /tmp/llm-request.json <<JSON
-          {
-            "model": "${MODEL}",
-            "messages": [
-              {
-                "role": "user",
-                "content": "Write a detailed technical deep-dive article for a Jekyll blog called 'NXP Wireless Daily'. Focus on an NXP wireless topic relevant to Wi-Fi, Bluetooth, Thread, Zigbee, Matter, UWB, NFC, or automotive wireless connectivity. Include clear sections: title, overview, key features, under the hood, where it shines (use cases), getting started, and takeaway. Keep it accurate, practical, and written for engineers. Use Markdown formatting only. Do not include code fences or YAML front matter. Keep it around 1200-1800 words."
-              }
-            ],
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "max_tokens": 4000
-          }
-          JSON
-
-          curl -fsSL "https://models.github.ai/inference/chat/completions" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            --data @/tmp/llm-request.json > /tmp/llm-response.json
-
-          python3 - "$FILE" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          output_path = pathlib.Path(sys.argv[1])
-          with open('/tmp/llm-response.json', 'r', encoding='utf-8') as fh:
-              data = json.load(fh)
-
-          choices = data.get('choices')
-          if not choices:
-              sys.exit('Model returned no choices: ' + json.dumps(data)[:500])
-
-          text = choices[0]['message']['content']
-          output_path.write_text(text.strip() + '\n', encoding='utf-8')
-          PY
+          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+            echo "::error::Missing OPENAI_API_KEY repository secret."
+            exit 1
+          fi
 
           python3 - <<'PY'
-          from pathlib import Path
           import datetime
+          import json
+          import os
+          import pathlib
+          import random
+          import time
+          import urllib.error
+          import urllib.request
 
-          archive = Path('index.md')
-          date = datetime.date.today().strftime('%Y-%m-%d')
-          link = f"- [{date}](posts/{date[:4]}/{date[5:7]}/{date[8:10]}.md)"
+          today = datetime.datetime.now(
+              datetime.timezone.utc
+          ).date()
 
-          text = archive.read_text(encoding='utf-8')
-          if link not in text:
-              marker = '## Archive'
-              idx = text.find(marker)
-              if idx == -1:
-                  text = text.rstrip() + '\n\n' + marker + '\n\n' + link + '\n'
+          date_string = today.isoformat()
+          post_path = pathlib.Path(
+              f"posts/{today:%Y}/{today:%m}/{today:%d}.md"
+          )
+          archive_path = pathlib.Path("index.md")
+
+          def update_archive():
+              link = f"- [{date_string}]({post_path.as_posix()})"
+
+              if archive_path.exists():
+                  text = archive_path.read_text(encoding="utf-8")
               else:
-                  insert_at = idx + len(marker)
-                  text = text[:insert_at] + '\n\n' + link + '\n' + text[insert_at:].lstrip('\n')
-              archive.write_text(text, encoding='utf-8')
+                  text = "# NXP Wireless Daily\n\n## Archive\n"
+
+              if link in text:
+                  print("Archive already contains today's link.")
+                  return
+
+              marker = "## Archive"
+              before, found, after = text.partition(marker)
+
+              if found:
+                  text = (
+                      before
+                      + marker
+                      + "\n\n"
+                      + link
+                      + "\n"
+                      + after.lstrip("\n")
+                  )
+              else:
+                  text = (
+                      text.rstrip()
+                      + "\n\n"
+                      + marker
+                      + "\n\n"
+                      + link
+                      + "\n"
+                  )
+
+              archive_path.write_text(text, encoding="utf-8")
+              print("Updated archive.")
+
+          # Avoid paying for another generation when rerunning today.
+          if post_path.exists() and post_path.stat().st_size > 0:
+              print(f"Today's post already exists: {post_path}")
+              update_archive()
+              raise SystemExit(0)
+
+          topics = [
+              "Wi-Fi connectivity architecture and integration",
+              "Bluetooth LE connectivity and low-power design",
+              "Thread networking and border-router architecture",
+              "Zigbee networking and interoperability",
+              "Matter commissioning and connectivity",
+              "UWB ranging and system integration",
+              "NFC reader integration and application design",
+              "automotive wireless connectivity architecture",
+          ]
+
+          topic = topics[today.toordinal() % len(topics)]
+
+          prompt = f"""
+          Write a detailed technical deep-dive article for a Jekyll
+          blog called "NXP Wireless Daily".
+
+          Editorial date: {date_string}.
+          Today's focus: {topic}, specifically in the context of
+          NXP wireless products and engineering workflows.
+
+          Requirements:
+          - Write approximately 1200-1800 words.
+          - Begin with one descriptive H1 article title.
+          - Include these H2 sections:
+            Overview
+            Key features
+            Under the hood
+            Where it shines (use cases)
+            Getting started
+            Takeaway
+          - Use Markdown only.
+          - Do not include code fences or YAML front matter.
+          - Write for engineers: accurate, practical, and specific.
+          - Clearly distinguish wireless-standard capabilities from
+            capabilities of a particular NXP device or software stack.
+          - Do not invent part numbers, specifications, SDK APIs,
+            benchmark figures, certifications, URLs, or release dates.
+          - Do not imply that you checked live documentation.
+          - If a product detail is uncertain, omit it or explicitly
+            tell readers to verify it in the current NXP documentation.
+          - Avoid unsupported claims about the latest announcements.
+          - Include practical integration constraints and tradeoffs.
+          - In Getting started, describe the documentation and hardware
+            checks an engineer should perform before implementation.
+          """
+
+          payload = {
+              "model": os.environ["OPENAI_MODEL"],
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a careful embedded wireless technical "
+                          "writer. Prioritize accuracy over specificity. "
+                          "You have no live browsing in this request."
+                      ),
+                  },
+                  {
+                      "role": "user",
+                      "content": prompt.strip(),
+                  },
+              ],
+              "temperature": 0.7,
+              "max_completion_tokens": 5000,
+          }
+
+          request = urllib.request.Request(
+              "https://api.openai.com/v1/chat/completions",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": (
+                      f"Bearer {os.environ['OPENAI_API_KEY']}"
+                  ),
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          retryable_statuses = {429, 500, 502, 503, 504}
+          max_attempts = 4
+
+          for attempt in range(1, max_attempts + 1):
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=180
+                  ) as response:
+                      data = json.load(response)
+                  break
+
+              except urllib.error.HTTPError as exc:
+                  error_body = exc.read().decode(
+                      "utf-8", errors="replace"
+                  )
+
+                  print(
+                      f"Model API returned HTTP {exc.code} "
+                      f"(attempt {attempt}/{max_attempts})."
+                  )
+
+                  if (
+                      exc.code not in retryable_statuses
+                      or attempt == max_attempts
+                  ):
+                      print(error_body[:8000])
+                      raise SystemExit(1)
+
+                  retry_after = exc.headers.get("Retry-After")
+                  try:
+                      delay = min(float(retry_after), 120)
+                  except (TypeError, ValueError):
+                      delay = min(
+                          10 * (2 ** (attempt - 1))
+                          + random.uniform(0, 3),
+                          120,
+                      )
+
+                  print(f"Retrying in {delay:.1f} seconds.")
+                  time.sleep(delay)
+
+              except (urllib.error.URLError, TimeoutError) as exc:
+                  print(
+                      f"Network error "
+                      f"(attempt {attempt}/{max_attempts}): {exc}"
+                  )
+
+                  if attempt == max_attempts:
+                      raise SystemExit(1)
+
+                  time.sleep(10 * (2 ** (attempt - 1)))
+
+          choices = data.get("choices")
+          if not choices:
+              print("::error::Model returned no choices.")
+              print(json.dumps(data)[:8000])
+              raise SystemExit(1)
+
+          choice = choices[0]
+          finish_reason = choice.get("finish_reason")
+
+          if finish_reason != "stop":
+              print(
+                  "::error::Model did not finish normally: "
+                  f"{finish_reason}. No post was written."
+              )
+              raise SystemExit(1)
+
+          text = choice.get("message", {}).get("content")
+
+          if not isinstance(text, str) or not text.strip():
+              print("::error::Model returned empty article content.")
+              raise SystemExit(1)
+
+          text = text.strip()
+
+          if text.startswith("---") or "```" in text:
+              print(
+                  "::error::Article contains YAML front matter "
+                  "or code fences, contrary to the prompt."
+              )
+              raise SystemExit(1)
+
+          post_path.parent.mkdir(parents=True, exist_ok=True)
+          post_path.write_text(text + "\n", encoding="utf-8")
+
+          print(f"Wrote {post_path}")
+          print(f"Approximate word count: {len(text.split())}")
+
+          update_archive()
           PY
 
       - name: Commit generated post
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add posts index.md
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- posts index.md
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "Daily NXP post"
-          git push
+
+          git commit -m "Daily NXP post $(date -u +%F)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
