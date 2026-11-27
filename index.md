@@ -8,6 +8,7 @@ A new deep-dive into NXP wireless chips every day — Wi-Fi/Bluetooth, Thread/Zi
 
 #### November
 
+- [2026-11-27](posts/2026/11/27.html)
 - [2026-11-26](posts/2026/11/26.html)
 - [2026-11-25](posts/2026/11/25.html)
 - [2026-11-24](posts/2026/11/24.html)
